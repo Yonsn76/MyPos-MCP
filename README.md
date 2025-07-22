@@ -20,7 +20,7 @@ Este es un proyecto de ejemplo para un **Model-Context-Protocol (MCP)** Server q
 1.  **Clonar el repositorio:**
 
     ```bash
-    git clone <URL-del-repositorio>
+    git clone https://github.com/Yonsn76/MyPos-MCP.git
     cd Mi-mcp
     ```
 
