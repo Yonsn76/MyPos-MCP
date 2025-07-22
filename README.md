@@ -1,14 +1,30 @@
-# MyPos MCP Project
+# <div align="center">MyPos MCP DB</div>
 
 Este es un proyecto de ejemplo para un **Model-Context-Protocol (MCP)** Server que se conecta a una base de datos.
 
 ## Características
 
 - Se conecta a bases de datos MySQL o PostgreSQL.
-- Proporciona herramientas para interactuar con la base de datos:
-  - `listarTablas`: Enumera todas las tablas en la base de datos.
-  - `consultarSQL`: Ejecuta una consulta `SELECT` en la base de datos.
-  - `columnasDeTabla`: Enumera las columnas de una tabla específica.
+- Proporciona herramientas para interactuar con la base de datos y administrar el esquema.
+
+## Herramientas disponibles
+
+- **listarTablas**: Enumera todas las tablas en la base de datos.
+- **consultarSQL**: Ejecuta una consulta `SELECT` y devuelve los resultados.
+- **columnasDeTabla**: Enumera las columnas de una tabla específica.
+- **crearTabla**: Crea una nueva tabla a partir de un objeto de definición.
+- **eliminarTabla**: Elimina una tabla de la base de datos.
+- **renombrarTabla**: Cambia el nombre de una tabla existente.
+- **agregarColumna**: Agrega una nueva columna a una tabla existente.
+- **eliminarColumna**: Elimina una columna de una tabla.
+- **renombrarColumna**: Cambia el nombre de una columna en una tabla.
+- **cambiarTipoColumna**: Cambia el tipo de datos de una columna (por ejemplo, a DATE, VARCHAR, etc).
+- **insertarDatos**: Inserta uno o varios registros en una tabla.
+- **crudTabla**: Permite realizar operaciones CRUD (crear, leer, actualizar, borrar) en cualquier tabla.
+- **agregarClaveForanea**: Agrega una clave foránea (FOREIGN KEY) entre tablas.
+- **eliminarClaveForanea**: Elimina una clave foránea por nombre.
+- **exportarTabla**: Exporta los datos de una tabla o columnas específicas a CSV o JSON.
+- **importarTabla**: Importa datos a una tabla desde CSV o JSON, permitiendo especificar columnas.
 
 ## Requisitos
 

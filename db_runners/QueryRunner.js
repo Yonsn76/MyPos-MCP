@@ -37,13 +37,29 @@ export default class QueryRunner {
     if (this.db_type === 'mysql') {
       const [rows, fields] = await this.pool.execute(sql);
       return {
-        columns: fields.map(f => ({ name: f.name })),
-        rows: rows
+        columns: fields ? fields.map(f => ({ name: f.name })) : [],
+        rows: Array.isArray(rows) ? rows : []
       };
     } else { // pg
       const res = await this.pool.query(sql);
       return {
-        columns: res.fields.map(f => ({ name: f.name })),
+        columns: res.fields ? res.fields.map(f => ({ name: f.name })) : [],
+        rows: res.rows || []
+      };
+    }
+  }
+
+  async runQueryWithParams(sql, params) {
+    if (this.db_type === 'mysql') {
+      const [rows, fields] = await this.pool.execute(sql, params);
+      return {
+        columns: fields ? fields.map(f => ({ name: f.name })) : [],
+        rows: rows
+      };
+    } else { // pg
+      const res = await this.pool.query(sql, params);
+      return {
+        columns: res.fields ? res.fields.map(f => ({ name: f.name })) : [],
         rows: res.rows
       };
     }
@@ -83,15 +99,20 @@ export default class QueryRunner {
   }
 
   async getTableColumns(table) {
-    if (this.db_type === 'mysql') {
-      const [cols] = await this.pool.execute(`SHOW COLUMNS FROM \`${table}\``);
-      return cols.map(c => c.Field);
-    } else { // pg
-      const res = await this.pool.query(`
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name = $1
-      `, [table]);
-      return res.rows.map(c => c.column_name);
+    try {
+      if (this.db_type === 'mysql') {
+        const [cols] = await this.pool.execute(`SHOW COLUMNS FROM \`${table}\``);
+        return cols.map(c => c.Field);
+      } else { // pg
+        const res = await this.pool.query(`
+          SELECT column_name FROM information_schema.columns
+          WHERE table_name = $1
+        `, [table]);
+        return res.rows.map(c => c.column_name);
+      }
+    } catch (error) {
+      // Si la tabla no existe, retornamos un array vacío
+      return [];
     }
   }
 
