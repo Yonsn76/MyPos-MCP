@@ -1,0 +1,37 @@
+# Dependencies
+/node_modules
+
+# Environment variables
+.env
+
+# Logs
+lua-error.log
+lua-debug.log
+
+#-*- Visual Studio Code -*-
+.vscode
+
+#-*- JetBrains -*-
+.idea
+
+#-*- SublimeText -*-
+*.sublime-project
+*.sublime-workspace
+
+#-*- NetBeans -*-
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+#-*- Eclipse -*-
+.settings/
+.project
+.classpath
+
+#-*- Mac -*-
+.DS_Store
+
+#-*- Windows -*-
+Thumbs.db

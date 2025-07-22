@@ -1,0 +1,17 @@
+{
+  "name": "mypos-mcp",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Servidor MCP para bases de datos SQL (MySQL/PostgreSQL)",
+  "main": "mcp_server.js",
+  "scripts": {
+    "start": "node mcp_server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.0",
+    "dotenv": "^16.4.5",
+    "mysql2": "^3.10.0",
+    "pg": "^8.11.3",
+    "zod": "^3.25.29"
+  }
+}
