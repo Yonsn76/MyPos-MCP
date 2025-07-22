@@ -90,6 +90,33 @@ server.tool(
   }
 );
 
+// --- Herramienta: Crear tabla --- 
+server.tool(
+  'crearTabla',
+  'Crea una nueva tabla en la base de datos.',
+  {
+    definicion: z.string().describe('Sentencia SQL CREATE TABLE completa. Ejemplo: CREATE TABLE personas (id INT, nombre VARCHAR(255))'),
+  },
+  async ({ definicion }) => {
+    try {
+      // Solo se permiten CREATE TABLE
+      if (!/^create table/i.test(definicion.trim())) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'Solo se permiten sentencias CREATE TABLE.' }]
+        };
+      }
+      await query_runner.runQuery(definicion);
+      return { content: [{ type: 'text', text: 'Tabla creada exitosamente.' }] };
+    } catch (e) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: 'Error al crear la tabla: ' + (e.message || e) }]
+      };
+    }
+  }
+);
+
 // --- Herramienta: Listar columnas de una tabla ---
 server.tool(
   'columnasDeTabla',
