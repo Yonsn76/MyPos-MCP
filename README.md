@@ -21,7 +21,7 @@ Este es un proyecto de ejemplo para un **Model-Context-Protocol (MCP)** Server q
 
     ```bash
     git clone https://github.com/Yonsn76/MyPos-MCP.git
-    cd Mi-mcp
+    cd MyPos-MCP
     ```
 
 2.  **Instalar dependencias:**
@@ -64,7 +64,8 @@ Para usar este MCP, puedes agregarlo a tu configuración con el siguiente objeto
        "args": [ 
          "-y", 
          "node", 
-         "C:/Users/Pociko/Desktop/MCP/legion-mcp/Mi-mcp/mcp_server.js" 
+         "C:/Users/Pociko/Desktop/MCP/legion-mcp/Mi-mcp/mcp_server.js"
+         //Aqui va la url del directorio en la cual esta el archivo mcp_server.js
        ] 
      }
 ```
