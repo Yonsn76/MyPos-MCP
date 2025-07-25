@@ -1,5 +1,5 @@
 {
-  "name": "MyPos MCP DB",
+  "name": "mypos-mcp-db",
   "type": "module",
   "version": "1.0.0",
   "description": "Servidor MCP para bases de datos SQL (MySQL/PostgreSQL)",
@@ -13,6 +13,6 @@
     "mysql2": "^3.10.0",
     "pg": "^8.11.3",
     "zod": "^3.25.29",
-    "json2csv": "^7.0.0"
+    "json2csv": "^5.0.7"
   }
 }

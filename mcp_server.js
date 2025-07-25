@@ -13,6 +13,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import QueryRunner from './db_runners/QueryRunner.js';
+// Elimino la importación de PROMPTS
+// import PROMPTS from './prompts.js';
 
 // 1. Configuración de la base de datos (lee de .env o hardcodea aquí)
 const db_type = process.env.DB_TYPE ;
@@ -38,6 +40,16 @@ function quoteIdent(ident) {
   return db_type === 'mysql' ? `\`${ident}\`` : `"${ident}"`;
 }
 
+// Utilidad para placeholders según motor
+function makePlaceholders(db_type, count, offset = 0) {
+  if (db_type === 'mysql') {
+    return Array(count).fill('?');
+  } else {
+    // PostgreSQL: $1, $2, ... (offset para casos como update)
+    return Array.from({ length: count }, (_, i) => `$${i + 1 + offset}`);
+  }
+}
+
 // 2. Crear el servidor MCP y registrar las herramientas
 const server = new McpServer({
   transport_logging: false, // Silencia el log de MCP para ver mejor los nuestros
@@ -45,10 +57,16 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
+// =================================================================
+// --- I. HERRAMIENTAS DE CONSULTA (LEER DATOS) ---
+// =================================================================
 // --- Herramienta: Listar tablas ---
 server.tool(
   'listarTablas',
-  'Lista todas las tablas de la base de datos.',
+  'Sigue estas reglas para listar tablas:\n'
+  + 'PROPÓSITO: Obtener una lista de todas las tablas en la base de datos.\n'
+  + 'USO: Úsalo cuando necesites saber qué tablas existen.\n'
+  + 'EJEMPLO: "Muestra las tablas disponibles."',
   {},
   async () => {
     const schema = await query_runner.getSchema();
@@ -60,10 +78,41 @@ server.tool(
   }
 );
 
+// --- Herramienta: Listar columnas de una tabla ---
+server.tool(
+  'columnasDeTabla',
+  'Sigue estas reglas para listar columnas:\n'
+  + 'PROPÓSITO: Obtener una lista con los nombres de todas las columnas de una tabla específica.\n'
+  + 'USO: Útil para conocer la estructura de una tabla antes de realizar una consulta o inserción.\n'
+  + 'EJEMPLO: "¿Cuáles son las columnas de la tabla ventas?"',
+  {
+    tabla: z.string().describe('Nombre de la tabla'),
+  },
+  async ({ tabla }) => {
+    try {
+      const columns = await query_runner.getTableColumns(tabla);
+      if (!columns || columns.length === 0) {
+        return { content: [{ type: 'text', text: `La tabla '${tabla}' no tiene columnas.` }] };
+      }
+      return {
+        content: [
+          { type: 'text', text: `Columnas de la tabla '${tabla}':\n` + columns.map(col => `- ${col}`).join('\n') }
+        ]
+      };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al listar columnas: ' + (e.message || e) }] };
+    }
+  }
+);
+
 // --- Herramienta: Ejecutar consulta SQL SELECT ---
 server.tool(
   'consultarSQL',
-  'Ejecuta una consulta SQL SELECT y devuelve los resultados como tabla.',
+  'Sigue estas reglas para consultar con SQL:\n'
+  + 'PROPÓSITO: Ejecutar una consulta SQL de solo lectura (SELECT) para obtener datos.\n'
+  + 'RESTRICCIÓN DE SEGURIDAD: Solo se permiten consultas que comiencen con SELECT. Cualquier otro tipo de consulta (INSERT, UPDATE, DELETE, DROP) será rechazado.\n'
+  + 'USO: Ideal para obtener datos específicos, filtrar o unir tablas.\n'
+  + 'EJEMPLO: "Muestra todos los clientes registrados."',
   {
     consulta: z.string().describe('Consulta SQL tipo SELECT'),
   },
@@ -97,12 +146,104 @@ server.tool(
   }
 );
 
+// --- Herramienta: Exportar tabla (CSV o JSON, columnas específicas) ---
+server.tool(
+  'exportarTabla',
+  'Sigue estas reglas para exportar una tabla:\n'
+  + 'PROPÓSITO: Exportar los datos de una tabla a un formato de texto (CSV o JSON).\n'
+  + 'USO: Especifica la tabla y el formato deseado. Opcionalmente, puedes indicar columnas específicas para exportar solo una parte de los datos.\n'
+  + 'EJEMPLO: "Exporta la tabla clientes a CSV."',
+  {
+    tabla: z.string().describe('Nombre de la tabla a exportar'),
+    formato: z.enum(['csv', 'json']).describe('Formato de exportación'),
+    columnas: z.array(z.string()).optional().describe('Columnas a exportar (opcional)'),
+  },
+  async ({ tabla, formato, columnas }) => {
+    try {
+      let sql = 'SELECT ';
+      if (columnas && columnas.length > 0) {
+        sql += columnas.map(quoteIdent).join(', ');
+      } else {
+        sql += '*';
+      }
+      sql += ` FROM ${quoteIdent(tabla)}`;
+      const result = await query_runner.runQuery(sql);
+      if (formato === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+      } else {
+        // CSV
+        const csv = json2csv(result.rows);
+        return { content: [{ type: 'text', text: csv }] };
+      }
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al exportar tabla: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// --- Herramienta: Importar tabla (CSV o JSON, columnas específicas) ---
+server.tool(
+  'importarTabla',
+  'Sigue estas reglas para importar a una tabla:\n'
+  + 'PROPÓSITO: Importar y insertar datos en una tabla desde un formato de texto (CSV o JSON).\n'
+  + 'PRECAUCIÓN: Asegúrate de que los datos en el texto coincidan con las columnas y tipos de la tabla destino para evitar errores.\n'
+  + 'USO: Proporciona el nombre de la tabla, los datos en formato de texto (string) y el formato (csv o json).\n'
+  + 'EJEMPLO: "Importa los datos del archivo clientes.csv a la tabla clientes."',
+  {
+    tabla: z.string().describe('Nombre de la tabla destino'),
+    datos: z.string().describe('Datos a importar (CSV o JSON)'),
+    formato: z.enum(['csv', 'json']).describe('Formato de los datos'),
+    columnas: z.array(z.string()).optional().describe('Columnas a importar (opcional, para CSV)'),
+  },
+  async ({ tabla, datos, formato, columnas }) => {
+    try {
+      let registros = [];
+      if (formato === 'json') {
+        registros = JSON.parse(datos);
+      } else {
+        // CSV
+        const rows = datos.split(/\r?\n/).filter(Boolean);
+        let headers = rows[0].split(',');
+        if (columnas && columnas.length > 0) {
+          headers = columnas;
+        }
+        registros = rows.slice(1).map(row => {
+          const values = row.split(',');
+          const obj = {};
+          headers.forEach((h, i) => { obj[h.trim()] = values[i]?.trim(); });
+          return obj;
+        });
+      }
+      let insertedCount = 0;
+      for (const registro of registros) {
+        const cols = columnas && columnas.length > 0 ? columnas : Object.keys(registro);
+        const valores = cols.map(c => registro[c]);
+        const placeholders = makePlaceholders(db_type, valores.length).join(', ');
+        const columnasStr = cols.map(col => quoteIdent(col)).join(', ');
+        const sql = `INSERT INTO ${quoteIdent(tabla)} (${columnasStr}) VALUES (${placeholders})`;
+        await query_runner.runQueryWithParams(sql, valores);
+        insertedCount++;
+      }
+      return { content: [{ type: 'text', text: `Se importaron ${insertedCount} registro(s) en la tabla '${tabla}' exitosamente.` }] };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al importar datos: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// =================================================================
+// --- II. HERRAMIENTAS DE CREACIÓN (AÑADIR DATOS O ESTRUCTURA) ---
+// =================================================================
 // --- Herramienta: Crear tabla ---
 server.tool(
   'crearTabla',
-  'Crea una nueva tabla en la base de datos usando un objeto con nombreTabla y columnas.',
+  'Sigue estas reglas para crear una tabla:\n'
+  + 'PROPÓSITO: Crear una tabla COMPLETAMENTE NUEVA en la base de datos.\n'
+  + 'REGLA: No uses esta herramienta para modificar o agregar columnas a una tabla que ya existe. La herramienta fallará si la tabla ya existe.\n'
+  + 'USO: Define el nombre de la tabla y la estructura de sus columnas.\n'
+  + 'EJEMPLO: "Crea la tabla productos con columnas id y nombre."',
   {
-    nombreTabla: z.string().describe('Nombre de la tabla a crear'),
+    nombreTabla: z.string().describe('Nombre de la nueva tabla'),
     columnas: z.array(z.object({
       nombre: z.string().describe('Nombre de la columna'),
       tipo: z.string().describe('Tipo y restricciones de la columna (ej. INT PRIMARY KEY AUTO_INCREMENT)'),
@@ -138,7 +279,11 @@ server.tool(
 // --- Herramienta: Agregar columna a tabla ---
 server.tool(
   'agregarColumna',
-  'Agrega una nueva columna a una tabla existente.',
+  'Sigue estas reglas para agregar una columna:\n'
+  + 'PROPÓSITO: Agregar una nueva columna a una tabla EXISTENTE.\n'
+  + 'REGLA: No la uses para crear tablas nuevas ni para modificar o eliminar columnas existentes.\n'
+  + 'PRECAUCIÓN: Asegúrate de que el nombre de la tabla y la nueva columna sean correctos antes de ejecutar.\n'
+  + 'EJEMPLO: "Agrega la columna email a la tabla usuarios."',
   {
     tabla: z.string().describe('Nombre de la tabla a modificar'),
     columna: z.string().describe('Nombre de la nueva columna'),
@@ -164,27 +309,14 @@ server.tool(
   }
 );
 
-// --- Herramienta: Listar columnas de una tabla ---
-server.tool(
-  'columnasDeTabla',
-  'Devuelve los nombres de columnas para una tabla específica.',
-  {
-    tabla: z.string().describe('Nombre de la tabla')
-  },
-  async ({ tabla }) => {
-    try {
-      const cols = await query_runner.getTableColumns(tabla);
-      return { content: [{ type: 'text', text: cols.join(', ') }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error: ' + (e.message || e) }] };
-    }
-  }
-);
-
 // --- Herramienta: Insertar datos en una tabla ---
 server.tool(
   'insertarDatos',
-  'Inserta datos en una tabla específica.',
+  'Sigue estas reglas para insertar datos:\n'
+  + 'PROPÓSITO: Insertar uno o varios registros (filas) nuevos en una tabla.\n'
+  + 'REGLA: Solo debe usarse para agregar datos nuevos. No la uses para actualizar registros existentes ni para modificar la estructura de la tabla.\n'
+  + 'FORMATO: Los datos deben ser un array de objetos, donde cada objeto es un registro.\n'
+  + 'EJEMPLO: "Agrega un cliente con nombre Juan a la tabla clientes."',
   {
     tabla: z.string().describe('Nombre de la tabla'),
     datos: z.array(z.record(z.any())).describe('Array de objetos con los datos a insertar'),
@@ -201,7 +333,7 @@ server.tool(
       for (const registro of datos) {
         const columnas = Object.keys(registro);
         const valores = Object.values(registro);
-        const placeholders = valores.map(() => '?').join(', ');
+        const placeholders = makePlaceholders(db_type, valores.length).join(', ');
         const columnasStr = columnas.map(col => quoteIdent(col)).join(', ');
         const sql = `INSERT INTO ${quoteIdent(tabla)} (${columnasStr}) VALUES (${placeholders})`;
         await query_runner.runQueryWithParams(sql, valores);
@@ -225,7 +357,12 @@ server.tool(
 // --- Herramienta: CRUD general para tablas ---
 server.tool(
   'crudTabla',
-  'Permite realizar operaciones CRUD (crear, leer, actualizar, borrar) en cualquier tabla.',
+  'Sigue estas reglas OBLIGATORIAS para operaciones CRUD:\n'
+  + 'PROPÓSITO: Realizar operaciones de Crear (create), Leer (read), Actualizar (update) o Eliminar (delete) registros en una tabla.\n'
+  + 'REGLA: Esta herramienta es solo para MANIPULAR DATOS, nunca para modificar la ESTRUCTURA de la tabla (ALTER, DROP, CREATE TABLE).\n'
+  + 'ACCIÓN DESTRUCTIVA (DELETE): Si la acción es "delete", es OBLIGATORIO pedir una confirmación explícita al usuario antes de ejecutar. El usuario DEBE escribir la frase exacta: "Confirmar eliminación de los registros filtrados en la tabla [nombreTabla]". Si la confirmación no es exacta, no procedas.\n'
+  + 'USO: Especifica la tabla, la acción, los datos (para create/update) y el filtro (para read/update/delete).\n'
+  + 'EJEMPLO: "Actualiza el email del cliente con id 5 en la tabla clientes."',
   {
     tabla: z.string().describe('Nombre de la tabla'),
     accion: z.enum(['create', 'read', 'update', 'delete']).describe('Acción CRUD a realizar'),
@@ -248,7 +385,7 @@ server.tool(
       if (accion === 'create') {
         const columnas = Object.keys(datos);
         const vals = Object.values(datos);
-        const placeholders = vals.map(() => '?').join(', ');
+        const placeholders = makePlaceholders(db_type, vals.length).join(', ');
         const columnasStr = columnas.map(col => quoteIdent(col)).join(', ');
         sql = `INSERT INTO ${quoteIdent(tabla)} (${columnasStr}) VALUES (${placeholders})`;
         valores = vals;
@@ -257,7 +394,7 @@ server.tool(
       } else if (accion === 'read') {
         let where = '';
         if (filtro && Object.keys(filtro).length > 0) {
-          const condiciones = Object.keys(filtro).map(col => `${quoteIdent(col)} = ?`);
+          const condiciones = Object.keys(filtro).map((col, i) => `${quoteIdent(col)} = ${makePlaceholders(db_type, 1, i)[0]}`);
           where = 'WHERE ' + condiciones.join(' AND ');
           valores = Object.values(filtro);
         }
@@ -268,9 +405,9 @@ server.tool(
         if (!filtro || Object.keys(filtro).length === 0) {
           return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar un filtro para actualizar.' }] };
         }
-        const setCols = Object.keys(datos).map(col => `${quoteIdent(col)} = ?`).join(', ');
+        const setCols = Object.keys(datos).map((col, i) => `${quoteIdent(col)} = ${makePlaceholders(db_type, 1, i)[0]}`).join(', ');
         const setVals = Object.values(datos);
-        const whereCols = Object.keys(filtro).map(col => `${quoteIdent(col)} = ?`).join(' AND ');
+        const whereCols = Object.keys(filtro).map((col, i) => `${quoteIdent(col)} = ${makePlaceholders(db_type, 1, setVals.length + i)[0]}`).join(' AND ');
         const whereVals = Object.values(filtro);
         sql = `UPDATE ${quoteIdent(tabla)} SET ${setCols} WHERE ${whereCols}`;
         valores = [...setVals, ...whereVals];
@@ -280,7 +417,7 @@ server.tool(
         if (!filtro || Object.keys(filtro).length === 0) {
           return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar un filtro para borrar.' }] };
         }
-        const whereCols = Object.keys(filtro).map(col => `${quoteIdent(col)} = ?`).join(' AND ');
+        const whereCols = Object.keys(filtro).map((col, i) => `${quoteIdent(col)} = ${makePlaceholders(db_type, 1, i)[0]}`).join(' AND ');
         const whereVals = Object.values(filtro);
         sql = `DELETE FROM ${quoteIdent(tabla)} WHERE ${whereCols}`;
         valores = whereVals;
@@ -294,30 +431,18 @@ server.tool(
   }
 );
 
-// --- Herramienta: Eliminar tabla ---
-server.tool(
-  'eliminarTabla',
-  'Elimina una tabla de la base de datos.',
-  {
-    nombreTabla: z.string().describe('Nombre de la tabla a eliminar'),
-  },
-  async ({ nombreTabla }) => {
-    try {
-      if (!nombreTabla) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar el nombre de la tabla.' }] };
-      }
-      await query_runner.runQuery(`DROP TABLE IF EXISTS ${quoteIdent(nombreTabla)}`);
-      return { content: [{ type: 'text', text: `Tabla '${nombreTabla}' eliminada exitosamente.` }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar la tabla: ' + (e.message || e) }] };
-    }
-  }
-);
-
+// =================================================================
+// --- III. HERRAMIENTAS DE ACTUALIZACIÓN (MODIFICAR DATOS O ESTRUCTURA) ---
+// =================================================================
 // --- Herramienta: Renombrar tabla ---
 server.tool(
   'renombrarTabla',
-  'Cambia el nombre de una tabla existente.',
+  'Sigue estas reglas OBLIGATORIAS para renombrar una tabla:\n'
+  + 'ADVERTENCIA: Renombrar una tabla es una acción delicada que puede romper consultas o vistas existentes que dependan de ella. Procede con cuidado.\n'
+  + 'PROPÓSITO: Cambiar el nombre de una tabla existente por uno nuevo.\n'
+  + 'VERIFICACIÓN: Asegúrate de que el nuevo nombre no esté ya en uso.\n'
+  + 'USO: Proporciona el nombre actual y el nuevo nombre.\n'
+  + 'EJEMPLO: "Renombra la tabla ventas a ventas_2024."',
   {
     nombreActual: z.string().describe('Nombre actual de la tabla'),
     nuevoNombre: z.string().describe('Nuevo nombre para la tabla'),
@@ -344,7 +469,12 @@ server.tool(
 // --- Herramienta: Renombrar columna ---
 server.tool(
   'renombrarColumna',
-  'Cambia el nombre de una columna en una tabla.',
+  'Sigue estas reglas OBLIGATORIAS para renombrar una columna:\n'
+  + 'ADVERTENCIA: Renombrar una columna es una acción delicada que puede romper consultas o código de aplicación que dependan de ella. Procede con cuidado.\n'
+  + 'PROPÓSITO: Cambiar el nombre de una columna existente dentro de una tabla.\n'
+  + 'REQUISITO: Debes proporcionar el tipo de dato de la columna junto con el nuevo nombre.\n'
+  + 'USO: Especifica la tabla, el nombre actual, el nuevo nombre y el tipo de dato.\n'
+  + 'EJEMPLO: "Renombra la columna nombre a nombre_completo en la tabla empleados."',
   {
     tabla: z.string().describe('Nombre de la tabla'),
     columnaActual: z.string().describe('Nombre actual de la columna'),
@@ -370,142 +500,15 @@ server.tool(
   }
 );
 
-// --- Herramienta: Eliminar columna ---
-server.tool(
-  'eliminarColumna',
-  'Elimina una columna de una tabla.',
-  {
-    tabla: z.string().describe('Nombre de la tabla'),
-    columna: z.string().describe('Nombre de la columna a eliminar'),
-  },
-  async ({ tabla, columna }) => {
-    try {
-      if (!tabla || !columna) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y la columna.' }] };
-      }
-      await query_runner.runQuery(`ALTER TABLE ${quoteIdent(tabla)} DROP COLUMN ${quoteIdent(columna)}`);
-      return { content: [{ type: 'text', text: `Columna '${columna}' eliminada de la tabla '${tabla}' exitosamente.` }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar la columna: ' + (e.message || e) }] };
-    }
-  }
-);
-
-// --- Herramienta: Agregar restricción UNIQUE ---
-server.tool(
-  'agregarRestriccionUnica',
-  'Agrega una restricción UNIQUE a una columna o conjunto de columnas.',
-  {
-    tabla: z.string().describe('Nombre de la tabla'),
-    columnas: z.array(z.string()).describe('Columnas a restringir como únicas'),
-    nombre: z.string().optional().describe('Nombre de la restricción (opcional)'),
-  },
-  async ({ tabla, columnas, nombre }) => {
-    try {
-      if (!tabla || !columnas || columnas.length === 0) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y al menos una columna.' }] };
-      }
-      const restriccion = nombre ? quoteIdent(nombre) : '';
-      const cols = columnas.map(quoteIdent).join(', ');
-      const sql = `ALTER TABLE ${quoteIdent(tabla)} ADD CONSTRAINT ${restriccion} UNIQUE (${cols})`;
-      await query_runner.runQuery(sql);
-      return { content: [{ type: 'text', text: 'Restricción UNIQUE agregada exitosamente.' }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al agregar restricción UNIQUE: ' + (e.message || e) }] };
-    }
-  }
-);
-
-// --- Herramienta: Eliminar restricción UNIQUE ---
-server.tool(
-  'eliminarRestriccionUnica',
-  'Elimina una restricción UNIQUE por nombre.',
-  {
-    tabla: z.string().describe('Nombre de la tabla'),
-    nombre: z.string().describe('Nombre de la restricción UNIQUE'),
-  },
-  async ({ tabla, nombre }) => {
-    try {
-      if (!tabla || !nombre) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y el nombre de la restricción.' }] };
-      }
-      let sql;
-      if (db_type === 'mysql') {
-        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP INDEX ${quoteIdent(nombre)}`;
-      } else {
-        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP CONSTRAINT ${quoteIdent(nombre)}`;
-      }
-      await query_runner.runQuery(sql);
-      return { content: [{ type: 'text', text: 'Restricción UNIQUE eliminada exitosamente.' }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar restricción UNIQUE: ' + (e.message || e) }] };
-    }
-  }
-);
-
-// --- Herramienta: Agregar clave foránea ---
-server.tool(
-  'agregarClaveForanea',
-  'Agrega una clave foránea a una tabla.',
-  {
-    tabla: z.string().describe('Tabla que tendrá la clave foránea'),
-    columnas: z.array(z.string()).describe('Columnas locales'),
-    tablaReferencia: z.string().describe('Tabla referenciada'),
-    columnasReferencia: z.array(z.string()).describe('Columnas referenciadas'),
-    nombre: z.string().optional().describe('Nombre de la clave foránea (opcional)'),
-    onDelete: z.string().optional().describe('Acción ON DELETE (ej. CASCADE, SET NULL)'),
-    onUpdate: z.string().optional().describe('Acción ON UPDATE (ej. CASCADE, SET NULL)'),
-  },
-  async ({ tabla, columnas, tablaReferencia, columnasReferencia, nombre, onDelete, onUpdate }) => {
-    try {
-      if (!tabla || !columnas || !tablaReferencia || !columnasReferencia) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar tabla, columnas, tablaReferencia y columnasReferencia.' }] };
-      }
-      const nombreFK = nombre ? `CONSTRAINT ${quoteIdent(nombre)} ` : '';
-      const cols = columnas.map(quoteIdent).join(', ');
-      const refCols = columnasReferencia.map(quoteIdent).join(', ');
-      let sql = `ALTER TABLE ${quoteIdent(tabla)} ADD ${nombreFK}FOREIGN KEY (${cols}) REFERENCES ${quoteIdent(tablaReferencia)} (${refCols})`;
-      if (onDelete) sql += ` ON DELETE ${onDelete}`;
-      if (onUpdate) sql += ` ON UPDATE ${onUpdate}`;
-      await query_runner.runQuery(sql);
-      return { content: [{ type: 'text', text: 'Clave foránea agregada exitosamente.' }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al agregar clave foránea: ' + (e.message || e) }] };
-    }
-  }
-);
-
-// --- Herramienta: Eliminar clave foránea ---
-server.tool(
-  'eliminarClaveForanea',
-  'Elimina una clave foránea por nombre.',
-  {
-    tabla: z.string().describe('Nombre de la tabla'),
-    nombre: z.string().describe('Nombre de la clave foránea'),
-  },
-  async ({ tabla, nombre }) => {
-    try {
-      if (!tabla || !nombre) {
-        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y el nombre de la clave foránea.' }] };
-      }
-      let sql;
-      if (db_type === 'mysql') {
-        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP FOREIGN KEY ${quoteIdent(nombre)}`;
-      } else {
-        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP CONSTRAINT ${quoteIdent(nombre)}`;
-      }
-      await query_runner.runQuery(sql);
-      return { content: [{ type: 'text', text: 'Clave foránea eliminada exitosamente.' }] };
-    } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar clave foránea: ' + (e.message || e) }] };
-    }
-  }
-);
-
 // --- Herramienta: Cambiar tipo de columna ---
 server.tool(
   'cambiarTipoColumna',
-  'Cambia el tipo de datos de una columna en una tabla.',
+  'Sigue estas reglas OBLIGATORIAS para cambiar el tipo de una columna:\n'
+  + 'ADVERTENCIA INICIAL: Informa al usuario que cambiar el tipo de dato de una columna es una acción PELIGROSA que puede resultar en PÉRDIDA DE DATOS si la conversión no es compatible.\n'
+  + 'CONFIRMACIÓN EXPLÍCITA: Para proceder, el usuario DEBE escribir la frase exacta: "Confirmar cambio de tipo para la columna [nombreColumna] a [nuevoTipo]".\n'
+  + 'VERIFICACIÓN ESTRICTA: No ejecutes la modificación si la confirmación no es exacta.\n'
+  + 'USO: Especifica la tabla, la columna y el nuevo tipo de dato.\n'
+  + 'EJEMPLO: "Cambia el tipo de la columna fecha a DATE en la tabla ventas."',
   {
     tabla: z.string().describe('Nombre de la tabla'),
     columna: z.string().describe('Nombre de la columna a modificar'),
@@ -530,80 +533,186 @@ server.tool(
   }
 );
 
-// --- Herramienta: Exportar tabla (CSV o JSON, columnas específicas) ---
+// =================================================================
+// --- IV. HERRAMIENTAS DE ELIMINACIÓN (BORRAR DATOS O ESTRUCTURA) ---
+// =================================================================
+// --- Herramienta: Eliminar tabla ---
 server.tool(
-  'exportarTabla',
-  'Exporta los datos de una tabla o columnas específicas a CSV o JSON.',
+  'eliminarTabla',
+  'Sigue estas reglas OBLIGATORIAS para eliminar una tabla:\n'
+  + 'ADVERTENCIA INICIAL: Informa al usuario que esta es una acción DESTRUCTIVA y PERMANENTE que no se puede deshacer.\n'
+  + 'CONFIRMACIÓN EXPLÍCITA: Para proceder, el usuario DEBE escribir la frase exacta: "Confirmar eliminación de la tabla [nombreTabla]", reemplazando [nombreTabla] con el nombre de la tabla a eliminar.\n'
+  + 'VERIFICACIÓN ESTRICTA: No ejecutes la eliminación si la frase de confirmación del usuario no es una coincidencia exacta.\n'
+  + 'USO EXCLUSIVO: Recuerda que esta herramienta solo elimina tablas completas, NUNCA registros o columnas individuales.',
   {
-    tabla: z.string().describe('Nombre de la tabla a exportar'),
-    formato: z.enum(['csv', 'json']).describe('Formato de exportación'),
-    columnas: z.array(z.string()).optional().describe('Columnas a exportar (opcional)'),
+    nombreTabla: z.string().describe('Nombre exacto de la tabla que se va a eliminar'),
   },
-  async ({ tabla, formato, columnas }) => {
+  async ({ nombreTabla }) => {
     try {
-      let sql = 'SELECT ';
-      if (columnas && columnas.length > 0) {
-        sql += columnas.map(quoteIdent).join(', ');
-      } else {
-        sql += '*';
+      if (!nombreTabla) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar el nombre de la tabla.' }] };
       }
-      sql += ` FROM ${quoteIdent(tabla)}`;
-      const result = await query_runner.runQuery(sql);
-      if (formato === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
-      } else {
-        // CSV
-        const csv = json2csv(result.rows);
-        return { content: [{ type: 'text', text: csv }] };
-      }
+      await query_runner.runQuery(`DROP TABLE IF EXISTS ${quoteIdent(nombreTabla)}`);
+      return { content: [{ type: 'text', text: `Tabla '${nombreTabla}' eliminada exitosamente.` }] };
     } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al exportar tabla: ' + (e.message || e) }] };
+      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar la tabla: ' + (e.message || e) }] };
     }
   }
 );
 
-// --- Herramienta: Importar tabla (CSV o JSON, columnas específicas) ---
+// --- Herramienta: Eliminar columna ---
 server.tool(
-  'importarTabla',
-  'Importa datos a una tabla desde CSV o JSON. Puedes especificar columnas.',
+  'eliminarColumna',
+  'Sigue estas reglas OBLIGATORIAS para eliminar una columna:\n'
+  + 'ADVERTENCIA INICIAL: Informa al usuario que eliminar una columna es una acción DESTRUCTIVA y PERMANENTE que borrará todos los datos que contiene.\n'
+  + 'CONFIRMACIÓN EXPLÍCITA: Para proceder, el usuario DEBE escribir la frase exacta: "Confirmar eliminación de la columna [nombreColumna] de la tabla [nombreTabla]".\n'
+  + 'VERIFICACIÓN ESTRICTA: No ejecutes la eliminación si la frase de confirmación no es una coincidencia exacta.\n'
+  + 'USO EXCLUSIVO: Úsala solo para eliminar columnas, no tablas ni registros.\n'
+  + 'EJEMPLO: "Elimina la columna edad de la tabla clientes."',
   {
-    tabla: z.string().describe('Nombre de la tabla destino'),
-    datos: z.string().describe('Datos a importar (CSV o JSON)'),
-    formato: z.enum(['csv', 'json']).describe('Formato de los datos'),
-    columnas: z.array(z.string()).optional().describe('Columnas a importar (opcional, para CSV)'),
+    tabla: z.string().describe('Nombre de la tabla'),
+    columna: z.string().describe('Nombre de la columna a eliminar'),
   },
-  async ({ tabla, datos, formato, columnas }) => {
+  async ({ tabla, columna }) => {
     try {
-      let registros = [];
-      if (formato === 'json') {
-        registros = JSON.parse(datos);
-      } else {
-        // CSV
-        const rows = datos.split(/\r?\n/).filter(Boolean);
-        let headers = rows[0].split(',');
-        if (columnas && columnas.length > 0) {
-          headers = columnas;
-        }
-        registros = rows.slice(1).map(row => {
-          const values = row.split(',');
-          const obj = {};
-          headers.forEach((h, i) => { obj[h.trim()] = values[i]?.trim(); });
-          return obj;
-        });
+      if (!tabla || !columna) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y la columna.' }] };
       }
-      let insertedCount = 0;
-      for (const registro of registros) {
-        const cols = columnas && columnas.length > 0 ? columnas : Object.keys(registro);
-        const valores = cols.map(c => registro[c]);
-        const placeholders = valores.map(() => '?').join(', ');
-        const columnasStr = cols.map(col => quoteIdent(col)).join(', ');
-        const sql = `INSERT INTO ${quoteIdent(tabla)} (${columnasStr}) VALUES (${placeholders})`;
-        await query_runner.runQueryWithParams(sql, valores);
-        insertedCount++;
-      }
-      return { content: [{ type: 'text', text: `Se importaron ${insertedCount} registro(s) en la tabla '${tabla}' exitosamente.` }] };
+      await query_runner.runQuery(`ALTER TABLE ${quoteIdent(tabla)} DROP COLUMN ${quoteIdent(columna)}`);
+      return { content: [{ type: 'text', text: `Columna '${columna}' eliminada de la tabla '${tabla}' exitosamente.` }] };
     } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: 'Error al importar datos: ' + (e.message || e) }] };
+      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar la columna: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// --- Herramienta: Eliminar restricción UNIQUE ---
+server.tool(
+  'eliminarRestriccionUnica',
+  'Sigue estas reglas OBLIGATORIAS para eliminar una restricción UNIQUE:\n'
+  + 'ADVERTENCIA INICIAL: Informa al usuario que eliminar esta restricción permitirá datos duplicados, lo que podría afectar la integridad de los datos.\n'
+  + 'CONFIRMACIÓN EXPLÍCITA: Para proceder, el usuario DEBE escribir la frase exacta: "Confirmar eliminación de la restricción [nombreRestriccion] de la tabla [nombreTabla]".\n'
+  + 'VERIFICACIÓN ESTRICTA: No ejecutes la eliminación si la confirmación no es exacta.\n'
+  + 'USO: Especifica la tabla y el nombre exacto de la restricción a eliminar.\n'
+  + 'EJEMPLO: "Elimina la restricción única email_unique de la tabla usuarios."',
+  {
+    tabla: z.string().describe('Nombre de la tabla'),
+    nombre: z.string().describe('Nombre de la restricción UNIQUE'),
+  },
+  async ({ tabla, nombre }) => {
+    try {
+      if (!tabla || !nombre) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y el nombre de la restricción.' }] };
+      }
+      let sql;
+      if (db_type === 'mysql') {
+        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP INDEX ${quoteIdent(nombre)}`;
+      } else {
+        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP CONSTRAINT ${quoteIdent(nombre)}`;
+      }
+      await query_runner.runQuery(sql);
+      return { content: [{ type: 'text', text: 'Restricción UNIQUE eliminada exitosamente.' }] };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar restricción UNIQUE: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// --- Herramienta: Eliminar clave foránea ---
+server.tool(
+  'eliminarClaveForanea',
+  'Sigue estas reglas OBLIGATORIAS para eliminar una clave foránea:\n'
+  + 'ADVERTENCIA INICIAL: Informa al usuario que eliminar una clave foránea puede llevar a datos huérfanos y romper la integridad referencial.\n'
+  + 'CONFIRMACIÓN EXPLÍCITA: Para proceder, el usuario DEBE escribir la frase exacta: "Confirmar eliminación de la clave foránea [nombreFK] de la tabla [nombreTabla]".\n'
+  + 'VERIFICACIÓN ESTRICTA: No ejecutes la eliminación si la confirmación no es exacta.\n'
+  + 'USO: Especifica la tabla y el nombre de la clave foránea a eliminar.\n'
+  + 'EJEMPLO: "Elimina la clave foránea fk_cliente de la tabla ventas."',
+  {
+    tabla: z.string().describe('Nombre de la tabla'),
+    nombre: z.string().describe('Nombre de la clave foránea'),
+  },
+  async ({ tabla, nombre }) => {
+    try {
+      if (!tabla || !nombre) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y el nombre de la clave foránea.' }] };
+      }
+      let sql;
+      if (db_type === 'mysql') {
+        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP FOREIGN KEY ${quoteIdent(nombre)}`;
+      } else {
+        sql = `ALTER TABLE ${quoteIdent(tabla)} DROP CONSTRAINT ${quoteIdent(nombre)}`;
+      }
+      await query_runner.runQuery(sql);
+      return { content: [{ type: 'text', text: 'Clave foránea eliminada exitosamente.' }] };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al eliminar clave foránea: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// --- Herramienta: Agregar restricción UNIQUE ---
+server.tool(
+  'agregarRestriccionUnica',
+  'Sigue estas reglas para agregar una restricción UNIQUE:\n'
+  + 'PROPÓSITO: Agregar una restricción de unicidad (UNIQUE) a una o más columnas para evitar valores duplicados.\n'
+  + 'REGLA: No la uses para crear tablas o columnas. La columna ya debe existir.\n'
+  + 'PRECAUCIÓN: La operación fallará si ya existen datos duplicados en la(s) columna(s) seleccionada(s).\n'
+  + 'USO: Especifica la tabla y las columnas que deben ser únicas.\n'
+  + 'EJEMPLO: "Haz que el campo email sea único en la tabla usuarios."',
+  {
+    tabla: z.string().describe('Nombre de la tabla'),
+    columnas: z.array(z.string()).describe('Columnas a restringir como únicas'),
+    nombre: z.string().optional().describe('Nombre de la restricción (opcional)'),
+  },
+  async ({ tabla, columnas, nombre }) => {
+    try {
+      if (!tabla || !columnas || columnas.length === 0) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar la tabla y al menos una columna.' }] };
+      }
+      const restriccion = nombre ? quoteIdent(nombre) : '';
+      const cols = columnas.map(quoteIdent).join(', ');
+      const sql = `ALTER TABLE ${quoteIdent(tabla)} ADD CONSTRAINT ${restriccion} UNIQUE (${cols})`;
+      await query_runner.runQuery(sql);
+      return { content: [{ type: 'text', text: 'Restricción UNIQUE agregada exitosamente.' }] };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al agregar restricción UNIQUE: ' + (e.message || e) }] };
+    }
+  }
+);
+
+// --- Herramienta: Agregar clave foránea ---
+server.tool(
+  'agregarClaveForanea',
+  'Sigue estas reglas para agregar una clave foránea:\n'
+  + 'PROPÓSITO: Crear una relación (clave foránea) entre dos tablas para mantener la integridad referencial.\n'
+  + 'REGLA: Las tablas y columnas involucradas ya deben existir.\n'
+  + 'PRECAUCIÓN: La operación puede fallar si los datos existentes violan la nueva restricción.\n'
+  + 'USO: Especifica la tabla local, sus columnas, la tabla de referencia y sus columnas.\n'
+  + 'EJEMPLO: "Agrega una clave foránea de cliente_id en ventas referenciando clientes(id)."',
+  {
+    tabla: z.string().describe('Tabla que tendrá la clave foránea'),
+    columnas: z.array(z.string()).describe('Columnas locales'),
+    tablaReferencia: z.string().describe('Tabla referenciada'),
+    columnasReferencia: z.array(z.string()).describe('Columnas referenciadas'),
+    nombre: z.string().optional().describe('Nombre de la clave foránea (opcional)'),
+    onDelete: z.string().optional().describe('Acción ON DELETE (ej. CASCADE, SET NULL)'),
+    onUpdate: z.string().optional().describe('Acción ON UPDATE (ej. CASCADE, SET NULL)'),
+  },
+  async ({ tabla, columnas, tablaReferencia, columnasReferencia, nombre, onDelete, onUpdate }) => {
+    try {
+      if (!tabla || !columnas || !tablaReferencia || !columnasReferencia) {
+        return { isError: true, content: [{ type: 'text', text: 'Debes proporcionar tabla, columnas, tablaReferencia y columnasReferencia.' }] };
+      }
+      const nombreFK = nombre ? `CONSTRAINT ${quoteIdent(nombre)} ` : '';
+      const cols = columnas.map(quoteIdent).join(', ');
+      const refCols = columnasReferencia.map(quoteIdent).join(', ');
+      let sql = `ALTER TABLE ${quoteIdent(tabla)} ADD ${nombreFK}FOREIGN KEY (${cols}) REFERENCES ${quoteIdent(tablaReferencia)} (${refCols})`;
+      if (onDelete) sql += ` ON DELETE ${onDelete}`;
+      if (onUpdate) sql += ` ON UPDATE ${onUpdate}`;
+      await query_runner.runQuery(sql);
+      return { content: [{ type: 'text', text: 'Clave foránea agregada exitosamente.' }] };
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: 'Error al agregar clave foránea: ' + (e.message || e) }] };
     }
   }
 );
